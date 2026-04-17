@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Drowsiness Detection</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 { text-align: center; margin-bottom: 20px; }
+        .video-container {
+            position: relative;
+            background: #1a1a1a;
+            border-radius: 15px;
+            overflow: hidden;
+            margin-bottom: 20px;
+        }
+        #video { width: 100%; display: block; }
+        .status {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            padding: 10px 20px;
+            border-radius: 25px;
+            font-weight: bold;
+        }
+        .alert { background: #4CAF50; }
+        .drowsy { background: #f44336; }
+        .controls { text-align: center; margin: 20px 0; }
+        button {
+            padding: 12px 24px;
+            margin: 5px;
+            border: none;
+            border-radius: 25px;
+            font-size: 1rem;
+            cursor: pointer;
+        }
+        .btn-start { background: #4CAF50; color: white; }
+        .btn-stop { background: #f44336; color: white; }
+        .stats {
+            background: #1a1a1a;
+            border-radius: 15px;
+            padding: 20px;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+        }
+        .stat { background: #2d2d2d; padding: 15px; border-radius: 10px; text-align: center; }
+        .stat-value { font-size: 2rem; font-weight: bold; color: #4CAF50; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚗 Drowsiness Detection System</h1>
+        
+        <div class="video-container">
+            <video id="video" autoplay playsinline></video>
+            <div id="status" class="status alert">🟢 ALERT</div>
+        </div>
+        
+        <div class="controls">
+            <button class="btn-start" onclick="start()">Start Detection</button>
+            <button class="btn-stop" onclick="stop()">Stop Detection</button>
+        </div>
+        
+        <div class="stats">
+            <div class="stat">
+                <div class="stat-label">System State</div>
+                <div class="stat-value" id="system_state" style="font-size: 1.5rem;">WAITING</div>
+            </div>
+            <div class="stat">
+                <div class="stat-label">Faces</div>
+                <div class="stat-value" id="faces_count">0</div>
+            </div>
+            <div class="stat">
+                <div class="stat-label">Alert Frames</div>
+                <div class="stat-value" id="alert">0</div>
+            </div>
+            <div class="stat">
+                <div class="stat-label">Drowsy Frames</div>
+                <div class="stat-value" id="drowsy" style="color:#f44336">0</div>
+            </div>
+            <div class="stat">
+                <div class="stat-label">FPS</div>
+                <div class="stat-value" id="fps">0</div>
+            </div>
+            <div class="stat">
+                <div class="stat-label">EAR</div>
+                <div class="stat-value" id="ear">--</div>
+            </div>
+            <div class="stat">
+                <div class="stat-label">ViT Prob</div>
+                <div class="stat-value" id="vit">--</div>
+            </div>
+        </div>
+        <!-- Hidden canvas for capturing frames -->
+        <canvas id="canvas" style="display:none;"></canvas>
+    </div>
+    
+    <script>
+        let video = document.getElementById('video');
+        let canvas = document.getElementById('canvas');
+        let ctx = canvas.getContext('2d');
+        let isDetecting = false;
+        let stats = { alert: 0, drowsy: 0, lastTime: Date.now() };
+        let isProcessingFrame = false; // Prevent overlapping API calls
+        
+        async function start() {
+            try {
+                // Lower resolution for faster base64 sending over network
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'user', width: 640, height: 480 } 
+                });
+                video.srcObject = stream;
+                
+                // Wait for video to start playing to get actual dimensions
+                video.onplaying = () => {
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    isDetecting = true;
+                    detectLoop();
+                };
+                
+                // Optional: Start session API call
+                fetch('/api/session/start', { method: 'POST' }).catch(console.error);
+                
+                document.getElementById('system_state').textContent = "RUNNING";
+                document.getElementById('system_state').style.color = "#4CAF50";
+                
+            } catch (error) {
+                console.error(error);
+                alert('Camera access denied or error occurred.');
+            }
+        }
+        
+        function stop() {
+            isDetecting = false;
+            if (video.srcObject) {
+                video.srcObject.getTracks().forEach(track => track.stop());
+            }
+            document.getElementById('system_state').textContent = "STOPPED";
+            document.getElementById('system_state').style.color = "white";
+            document.getElementById('status').textContent = '😴 OFFLINE';
+            document.getElementById('status').className = 'status';
+            document.getElementById('status').style.background = '#888';
+        }
+        
+        async function detectLoop() {
+            if (!isDetecting) return;
+            
+            // Limit framerate: only run if not currently waiting for a response
+            if (isProcessingFrame) {
+                requestAnimationFrame(detectLoop);
+                return;
+            }
+            
+            isProcessingFrame = true;
+            
+            // 1. Draw video frame to canvas
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            
+            // 2. Convert canvas to base64 jpeg
+            // 60% quality is a good balance between compression and detection accuracy
+            const base64Image = canvas.toDataURL('image/jpeg', 0.6); 
+            
+            try {
+                // 3. Send to actual API
+                const response = await fetch('/api/detect', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ image: base64Image })
+                });
+                
+                if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                
+                const data = await response.json();
+                
+                // 4. Update UI with results from backend
+                const isDrowsy = data.overall_drowsy;
+                document.getElementById('faces_count').textContent = data.faces_detected || 0;
+                
+                if (data.faces_detected > 0 && data.faces[0]) {
+                    const face = data.faces[0];
+                    if (face.ear && face.ear.ear !== null) {
+                        document.getElementById('ear').textContent = face.ear.ear.toFixed(2);
+                    }
+                    if (face.vit && face.vit.drowsy_probability !== null) {
+                        document.getElementById('vit').textContent = (face.vit.drowsy_probability * 100).toFixed(1) + '%';
+                    }
+                } else {
+                    document.getElementById('ear').textContent = '--';
+                    document.getElementById('vit').textContent = '--';
+                }
+                
+                if (isDrowsy) {
+                    stats.drowsy++;
+                    document.getElementById('status').textContent = '🔴 DROWSY';
+                    document.getElementById('status').className = 'status drowsy';
+                    document.getElementById('status').style.background = '#f44336';
+                } else {
+                    if (data.faces_detected > 0) {
+                        stats.alert++;
+                        document.getElementById('status').textContent = '🟢 ALERT';
+                        document.getElementById('status').className = 'status alert';
+                        document.getElementById('status').style.background = '#4CAF50';
+                    } else {
+                        document.getElementById('status').textContent = '🟡 NO FACE';
+                        document.getElementById('status').className = 'status';
+                        document.getElementById('status').style.background = '#ff9800';
+                    }
+                }
+                
+                // Update FPS & Stats
+                const now = Date.now();
+                const fps = 1000 / (now - stats.lastTime);
+                stats.lastTime = now;
+                
+                document.getElementById('alert').textContent = stats.alert;
+                document.getElementById('drowsy').textContent = stats.drowsy;
+                document.getElementById('fps').textContent = fps.toFixed(1);
+                
+            } catch (err) {
+                console.error('Detection error:', err);
+            } finally {
+                isProcessingFrame = false;
+                // Add a small 100ms delay between frames so it doesn't max out the GPU constantly
+                setTimeout(() => requestAnimationFrame(detectLoop), 100);
+            }
+        }
+    </script>
+</body>
+</html>

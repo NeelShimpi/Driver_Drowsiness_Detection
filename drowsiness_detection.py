@@ -9,6 +9,14 @@ import time
 import warnings
 warnings.filterwarnings('ignore')
 
+# --- HARDWARE COMPATIBILITY FIX FOR RTX 50-SERIES ---
+# Disable pre-compiled fused attention kernels that crash on sm_120
+if torch.cuda.is_available():
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
+# ----------------------------------------------------
+
 # Eye Aspect Ratio calculation
 def eye_aspect_ratio(eye):
     """
@@ -45,7 +53,7 @@ class DrowsinessDetector:
     def __init__(self, 
                  haar_cascade_path='haarcascade_frontalface_default.xml',
                  shape_predictor_path='shape_predictor_68_face_landmarks.dat',
-                 vit_model_path=r"C:\Users\neels\Desktop\AIML repositories\project\drowsiness_model.pth",
+                 vit_model_path='drowsiness_model_timm.pth',
                  use_cuda=True):
         """
         Initialize the drowsiness detection system
@@ -84,34 +92,29 @@ class DrowsinessDetector:
         self.EAR_CONSEC_FRAMES = 20
         self.frame_counter = 0
         self.drowsy_flag = False
+        self.last_alarm_time = 0
         
         # MAR (yawn) thresholds
-        self.MAR_THRESHOLD = 0.75       # Mouth open ratio threshold for yawn
-        self.YAWN_CONSEC_FRAMES = 15    # Consecutive frames mouth must be open
+        self.MAR_THRESHOLD = 0.55       # Lowered to catch yawns more easily
+        self.YAWN_CONSEC_FRAMES = 5     # Reduced from 15 to trigger faster
         self.yawn_frame_counter = 0
         self.yawn_flag = False
         self.total_yawns = 0
         
-        # Load Vision Transformer model
-        from vit_model import VisionTransformerDrowsiness
-        self.vit_model = VisionTransformerDrowsiness(
-            img_size=224,
-            patch_size=16,
-            num_classes=4,
-            dim=768,
-            depth=12,
-            heads=12,
-            mlp_dim=3072
-        ).to(self.device)
+        import timm
+        # Creating true Vision Transformer as requested
+        self.vit_model = timm.create_model('vit_tiny_patch16_224', pretrained=False, num_classes=6)
+        self.vit_model = self.vit_model.to(self.device)
         
         # Load pretrained weights if available
         try:
             self.vit_model.load_state_dict(torch.load(vit_model_path, map_location=self.device))
             self.vit_model.eval()
             print("Vision Transformer model loaded successfully")
-        except:
-            print("Warning: No pretrained ViT model found. Using random initialization.")
-            print("For production, train the model first using train_vit.py")
+        except Exception as e:
+            print(f"Warning: Failed to load ViT model from {vit_model_path}")
+            print(f"Error details: {e}")
+            print("Using random initialization. For production, train the model first using train_vit.py")
         
         # Statistics
         self.total_frames = 0
@@ -256,17 +259,43 @@ class DrowsinessDetector:
     
     def detect_drowsiness_vit(self, frame):
         """
-        Detect drowsiness using Vision Transformer
+        Detect drowsiness using Vision Transformer via a closely-cropped face region.
         
         Args:
             frame: Input video frame
             
         Returns:
-            prediction: Drowsiness probability
-            class_label: 0 (alert) or 1 (drowsy)
+            drowsy_prob: Probability of drowsiness
+            class_label: The raw class index
         """
+        # Find the face first to avoid feeding the background into the model
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.face_cascade.detectMultiScale(gray, 1.3, 5)
+        
+        if len(faces) == 0:
+            return 0.0, 2  # No face detected => Return 'open' (alert) as default to avoid false alarms
+            
+        # Get the largest face
+        x, y, w, h = max(faces, key=lambda rect: rect[2] * rect[3])
+        
+        # Add a 20% margin just like the training dataset images
+        margin_x = int(w * 0.2)
+        margin_y = int(h * 0.2)
+        
+        y1 = max(0, y - margin_y)
+        y2 = min(frame.shape[0], y + h + margin_y)
+        x1 = max(0, x - margin_x)
+        x2 = min(frame.shape[1], x + w + margin_x)
+        
+        # Crop the face from the frame
+        face_img = frame[y1:y2, x1:x2]
+        
+        # Fallback if crop mathematically fails
+        if face_img.size == 0:
+            face_img = frame
+
         # Preprocess frame for ViT
-        face_img = cv2.resize(frame, (224, 224))
+        face_img = cv2.resize(face_img, (224, 224))
         face_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
         face_img = face_img.astype(np.float32) / 255.0
         
@@ -283,7 +312,21 @@ class DrowsinessDetector:
         with torch.no_grad():
             outputs = self.vit_model(face_tensor)
             probabilities = torch.softmax(outputs, dim=1)
-            drowsy_prob = probabilities[0][1].item()
+            
+            # Dataset Classes (Alphabetical): 
+            # 0: Active Subjects  (Alert)
+            # 1: Fatigue Subjects (Drowsy)
+            # 2: closed           (Drowsy)
+            # 3: no_yawn          (Alert)
+            # 4: open             (Alert)
+            # 5: yawn             (Drowsy)
+            
+            prob_fatigue = probabilities[0][1].item()
+            prob_closed = probabilities[0][2].item()
+            prob_yawn = probabilities[0][5].item()
+            
+            # Total probability of being drowsy
+            drowsy_prob = prob_fatigue + prob_closed + prob_yawn
             class_label = torch.argmax(probabilities, dim=1).item()
         
         return drowsy_prob, class_label
@@ -543,7 +586,8 @@ class DrowsinessDetector:
             # ViT-based detection
             if use_vit:
                 current_vit_prob, vit_class = self.detect_drowsiness_vit(frame)
-                vit_drowsy = vit_class == 1
+                # Drowsy only if the model predicts it AND is highly confident (>70%)
+                vit_drowsy = (vit_class in [0, 3]) and (current_vit_prob > 0.70)
             else:
                 vit_drowsy = False
                 current_vit_prob = 0.0
@@ -563,6 +607,18 @@ class DrowsinessDetector:
                 else:
                     cv2.putText(frame, "*** WAKE UP! ***", (10, 110),
                                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 4)
+                
+                # Play audio alarm (non-blocking)
+                if time.time() - self.last_alarm_time > 1.0:
+                    self.last_alarm_time = time.time()
+                    try:
+                        import winsound
+                        import threading
+                        # Beep at 2500Hz for 500ms
+                        threading.Thread(target=lambda: winsound.Beep(2500, 500), daemon=True).start()
+                    except ImportError:
+                        pass
+                        
             else:
                 self.alert_frames += 1
             

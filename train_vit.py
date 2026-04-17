@@ -5,11 +5,21 @@ from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms, models
 import matplotlib.pyplot as plt
 
+# --- HARDWARE COMPATIBILITY FIX FOR RTX 50-SERIES ---
+# Disable pre-compiled fused attention kernels that crash on sm_120
+if torch.cuda.is_available():
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
+    # The ultimate sledgehammer for RTX 50-series: disable cuDNN convolutions
+    torch.backends.cudnn.enabled = False
+# ----------------------------------------------------
+
 # =========================
 # CONFIG
 # =========================
 
-DATASET_DIR = "C:\\Users\\neels\\Desktop\\AIML repositories\\project\\driver_drowsiness_dataset"
+DATASET_DIR = r"C:\Users\neels\MajorProject\project\driver_drowsiness_dataset\dataset"
 IMG_SIZE = 224
 BATCH_SIZE = 32
 EPOCHS = 20
@@ -62,10 +72,10 @@ val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 # MODEL
 # =========================
 
-model = models.resnet18(pretrained=True)
+import timm
 
-# Replace final layer for 4 classes
-model.fc = nn.Linear(model.fc.in_features, 4)
+# We use vit_tiny_patch16_224 since it fits beautifully on a laptop for real-time video streaming
+model = timm.create_model('vit_tiny_patch16_224', pretrained=True, num_classes=len(class_names))
 
 model = model.to(device)
 
@@ -150,7 +160,7 @@ for epoch in range(EPOCHS):
 # SAVE MODEL
 # =========================
 
-torch.save(model.state_dict(), "drowsiness_model.pth")
+torch.save(model.state_dict(), "drowsiness_model_timm.pth")
 
 print("\nModel saved!")
 

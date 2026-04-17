@@ -1,0 +1,5 @@
+﻿Analyzing drowsiness_app...                                     
+
+warning - Unused import: 'dart:io' - lib\main.dart:3:8 - unused_import
+  error - The named parameter 'camera' is required, but there's no corresponding argument - test\widget_test.dart:16:35 - missing_required_argument
+

@@ -5,3 +5,10 @@
 # Python cache
 __pycache__/
 
+# Datasets and Images
+driver_drowsiness_dataset/
+dataset/
+
+# Large Model weights
+drowsiness_model.pth
+*.dat.bz2
